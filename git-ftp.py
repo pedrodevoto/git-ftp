@@ -41,6 +41,7 @@ import optparse
 import logging
 import textwrap
 import fnmatch
+import paramiko # use for sftp
 
 # Note about Tree.path/Blob.path: *real* Git trees and blobs don't
 # actually provide path information, but the git-python bindings, as a
@@ -71,6 +72,77 @@ class FtpSslNotSupported(Exception):
 
 class SectionNotFound(Exception):
     pass
+
+class FTP(object):
+    def __init__(self, host, port, username, password, sftp, ssl):
+        if sftp:
+            t = paramiko.Transport((host, port))
+            t.connect(username=username, password=password)
+            self.ftp = paramiko.SFTPClient.from_transport(t)
+            self.sftp = True
+        else:
+            if ssl:
+                if hasattr(ftplib, 'FTP_TLS'):  # SSL new in 2.7+
+                    self.ftp = ftplib.FTP_TLS()
+                    self.ftp.connect(host, port)
+                    self.ftp.login(username, password)
+                    ftp.prot_p()
+                    logging.info("Using SSL")
+                else:
+                    raise FtpSslNotSupported("Python is too old for FTP SSL. Try using Python 2.7 or later.")
+            else:
+                self.ftp = ftplib.FTP()
+                self.ftp.connect(host, port)
+                self.ftp.login(username, password)
+            self.sftp = False
+    
+    def cwd(self, path):
+        if (self.sftp):
+            self.ftp.chdir(path)
+        else:
+            self.ftp.cwd(path)
+
+    def retrbinary(self, file, stream):
+        if (self.sftp):
+            self.ftp.getfo(file, stream)
+        else:
+            self.ftp.retrbinary('RETR '+file, stream.write)
+
+    def storbinary(self, file, stream):
+        if (self.sftp):
+            self.ftp.putfo(stream, file)
+        else:
+            self.ftp.storbinary('STOR '+file, stream)
+    
+    def quit(self):
+        if (self.sftp):
+            self.ftp.close()
+        else:
+            self.ftp.quit()
+        
+    def delete(self, path):
+        if (self.sftp):
+            self.ftp.remove(path)
+        else:
+            self.ftp.delete(path)
+        
+    def rmd(self, path):
+        if (self.sftp):
+            self.ftp.rmdir(path)
+        else:
+            self.ftp.rmd(path)
+        
+    def mkd(self, path):
+        if (self.sftp):
+            self.ftp.mkdir(path)
+        else:
+            self.ftp.mkd(path)
+        
+    def chmod(self, mode, path):
+        if (self.sftp):
+            self.ftp.chmod(path, 0100644)
+        else:
+            self.ftp.voidcmd('SITE CHMOD '+mode+' '+path)
 
 
 def split_pattern(path):  # TODO: Improve skeevy code
@@ -136,15 +208,7 @@ def main():
     if options.commit:
         commit = repo.commit(options.commit)
     tree = commit.tree
-    if options.ftp.ssl:
-        if hasattr(ftplib, 'FTP_TLS'):  # SSL new in 2.7+
-            ftp = ftplib.FTP_TLS(options.ftp.hostname, options.ftp.username, options.ftp.password)
-            ftp.prot_p()
-            logging.info("Using SSL")
-        else:
-            raise FtpSslNotSupported("Python is too old for FTP SSL. Try using Python 2.7 or later.")
-    else:
-        ftp = ftplib.FTP(options.ftp.hostname, options.ftp.username, options.ftp.password)
+    ftp = FTP(options.ftp.hostname, options.ftp.port, options.ftp.username, options.ftp.password, options.ftp.sftp, options.ftp.ssl)
     ftp.cwd(base)
 
     # Check revision
@@ -152,9 +216,9 @@ def main():
     if not options.force and not hash:
         hashFile = cStringIO.StringIO()
         try:
-            ftp.retrbinary('RETR git-rev.txt', hashFile.write)
+            ftp.retrbinary('git-rev.txt', hashFile)
             hash = hashFile.getvalue().strip()
-        except ftplib.error_perm:
+        except Exception, e:
             pass
 
     # Load ftpignore rules, if any
@@ -177,7 +241,7 @@ def main():
     else:
         upload_diff(repo, oldtree, tree, ftp, [base], patterns)
 
-    ftp.storbinary('STOR git-rev.txt', cStringIO.StringIO(commit.hexsha))
+    ftp.storbinary('git-rev.txt', cStringIO.StringIO(commit.hexsha))
     ftp.quit()
 
 
@@ -249,8 +313,10 @@ class FtpData():
     password = None
     username = None
     hostname = None
+    port = None
     remotepath = None
     ssl = None
+    sftp = None
     gitftpignore = None
 
 
@@ -301,6 +367,17 @@ def get_ftp_creds(repo, options):
             options.ftp.ssl = boolish(cfg.get(options.section, 'ssl'))
         except ConfigParser.NoOptionError:
             options.ftp.ssl = False
+        try:
+            options.ftp.sftp = boolish(cfg.get(options.section, 'sftp'))
+        except ConfigParser.NoOptionError:
+            options.ftp.sftp = False
+        try:
+            options.ftp.port = int(cfg.get(options.section, 'port'))
+        except ConfigParser.NoOptionError:
+            if options.ftp.sftp:
+                options.ftp.port = 22
+            else:
+                options.ftp.port = 21
 
         try:
             options.ftp.gitftpignore = cfg.get(options.section, 'gitftpignore')
@@ -372,7 +449,7 @@ def upload_diff(repo, oldtree, tree, ftp, base, ignored):
             try:
                 ftp.delete(file)
                 logging.info('Deleted ' + file)
-            except ftplib.error_perm:
+            except Exception, e:
                 logging.warning('Failed to delete ' + file)
 
             # Now let's see if we need to remove some subdirectories
@@ -389,7 +466,7 @@ def upload_diff(repo, oldtree, tree, ftp, base, ignored):
                     try:
                         ftp.rmd(dir)
                         logging.debug('Cleaned away ' + dir)
-                    except ftplib.error_perm:
+                    except Exception, e:
                         logging.info('Did not clean away ' + dir)
                         break
         else:
@@ -408,7 +485,7 @@ def upload_diff(repo, oldtree, tree, ftp, base, ignored):
                     subtree = subtree / c
                     try:
                         ftp.mkd(subtree.path)
-                    except ftplib.error_perm:
+                    except Exception, e:
                         pass
 
             if isinstance(node, Blob):
@@ -455,12 +532,12 @@ def upload_blob(blob, ftp, quiet=False):
         logging.info('Uploading ' + blob.path)
     try:
         ftp.delete(blob.path)
-    except ftplib.error_perm:
+    except Exception, e:
         pass
-    ftp.storbinary('STOR ' + blob.path, blob.data_stream)
+    ftp.storbinary(blob.path, blob.data_stream)
     try:
-        ftp.voidcmd('SITE CHMOD ' + format_mode(blob.mode) + ' ' + blob.path)
-    except ftplib.error_perm:
+        ftp.chmod(format_mode(blob.mode), blob.path)
+    except Exception, e:
         # Ignore Windows chmod errors
         logging.warning('Failed to chmod ' + blob.path)
         pass
